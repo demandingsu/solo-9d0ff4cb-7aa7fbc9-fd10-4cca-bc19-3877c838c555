@@ -13,6 +13,11 @@ MAX_ROWS = 200_000
 MAX_BYTES = 10 * 1024 * 1024
 MAX_ERRORS = 20
 
+# 十进制精度上限：仅用于拒绝病态输入（如 1e-999999 会撑爆文本存储），
+# 远高于电表实际精度（合法大累计读数 1e-5 kWh 只需 5 位小数）。
+MAX_DECIMAL_PLACES = 18
+MAX_SIGNIFICANT_DIGITS = 40
+
 READINGS_FIELDS = ["mp", "meter", "ts", "cum_kwh"]
 METER_CHANGES_FIELDS = ["mp", "change_ts", "old_meter", "new_meter",
                         "old_final_kwh", "new_initial_kwh"]
@@ -59,6 +64,15 @@ def _parse_hour(raw: str, errors: list[str], rowno: int, field: str):
     return fmt_ts(dt)
 
 
+def canonical_kwh(v: Decimal) -> str:
+    """把校验过的 Decimal 规范化为十进制文本（固定小数位，无指数，保留输入精度）。
+
+    ``Decimal`` 会保留尾随零（``1.2300`` 与 ``1.23`` 数值相等、文本不同），
+    这里用 ``format(..., 'f')`` 保留输入的小数位数，作为入库与响应使用的原文。
+    """
+    return format(v, "f")
+
+
 def _parse_kwh(raw: str, errors: list[str], rowno: int, field: str):
     s = (raw or "").strip()
     try:
@@ -68,6 +82,14 @@ def _parse_kwh(raw: str, errors: list[str], rowno: int, field: str):
         return None
     if not v.is_finite() or v < 0 or v > Decimal("1e12"):
         errors.append(f"第 {rowno} 行: {field}={s!r} 超出合法范围 [0, 1e12]")
+        return None
+    # 拒绝病态精度（不影响电表正常精度），避免文本/大数运算被拖垮。
+    sign, digits, exponent = v.as_tuple()
+    if len(digits) > MAX_SIGNIFICANT_DIGITS or (isinstance(exponent, int) and exponent < -MAX_DECIMAL_PLACES):
+        errors.append(
+            f"第 {rowno} 行: {field}={s!r} 小数位/有效位过多 "
+            f"(最多 {MAX_DECIMAL_PLACES} 位小数、{MAX_SIGNIFICANT_DIGITS} 位有效数字)"
+        )
         return None
     return v
 

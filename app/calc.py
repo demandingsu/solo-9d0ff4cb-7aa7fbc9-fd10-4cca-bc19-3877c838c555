@@ -5,11 +5,15 @@
   需要 00:00 .. 次日 00:00 共 25 个整点读数。
 - 换表整点 T：换表单给出旧表末读数与新表初值（边界读数），可代替该整点的常规读数；
   T-1→T 为旧表末段，T→T+1 为新表首段，分别计算后相加。
+- 所有累计读数/边界读数按十进制原文（TEXT）读入 ``Decimal``，增量与日总量
+  全程十进制精确相减/求和，不做浮点转换、不做定点量化。
 - 以下情况不给出确定日总量，只返回待核区间：
-  missing_hour            缺整点
-  unrecorded_meter_change 无单据换表
-  meter_regression        同表倒退
-  boundary_conflict       边界读数冲突（常规读数与换表单边界读数不一致）
+  missing_hour               缺整点
+  unrecorded_meter_change    无单据换表
+  meter_regression           同表倒退
+  boundary_conflict          边界读数冲突（常规读数与换表单边界读数不一致）
+  legacy_precision_unverified 读数由旧库 REAL 迁移，原始小数不可知，
+                              在按原始 CSV 重新导入校正前，相关增量一律待核
 """
 from __future__ import annotations
 
@@ -25,10 +29,9 @@ REASON_MISSING = "missing_hour"
 REASON_UNRECORDED = "unrecorded_meter_change"
 REASON_REGRESSION = "meter_regression"
 REASON_CONFLICT = "boundary_conflict"
+REASON_LEGACY = "legacy_precision_unverified"
 
 INSTANCE = os.environ.get("INSTANCE_NAME") or socket.gethostname()
-
-_QUANT = Decimal("0.000001")
 
 
 def fmt_ts(dt: datetime) -> str:
@@ -36,14 +39,22 @@ def fmt_ts(dt: datetime) -> str:
 
 
 def _dec(value) -> Decimal:
-    """SQLite REAL -> Decimal（str 最短往返，避免二进制浮点误差）。"""
+    """已入库的十进制原文 -> Decimal。兼容迁移前的 REAL（仅旧库遗留调用）。"""
+    if isinstance(value, Decimal):
+        return value
     return Decimal(str(value))
 
 
-def _num(d: Optional[Decimal]) -> Optional[float]:
+def _out(d: Optional[Decimal]) -> Optional[Decimal]:
+    """输出用的精确十进制（整数值补 ``.0``，保持 API 原有数值型语义）。"""
     if d is None:
         return None
-    return float(d.quantize(_QUANT))
+    if d == 0:
+        d = abs(d)  # 不输出 -0
+    text = format(d, "f")
+    if "." not in text:
+        text += ".0"
+    return Decimal(text)
 
 
 def compute_day(conn, mp: str, day: date) -> dict:
@@ -52,12 +63,15 @@ def compute_day(conn, mp: str, day: date) -> dict:
     hours = [t0 + i * HOUR for i in range(25)]
     t1 = hours[24]
 
-    csv_at: dict[str, dict[str, Decimal]] = {}
+    # ts -> meter -> (Decimal 读数, 是否旧库未校正)
+    csv_at: dict[str, dict[str, tuple[Decimal, bool]]] = {}
     for row in conn.execute(
-        "SELECT meter, ts, cum_kwh FROM readings WHERE mp = ? AND ts BETWEEN ? AND ?",
+        "SELECT meter, ts, cum_kwh, legacy_unverified FROM readings"
+        " WHERE mp = ? AND ts BETWEEN ? AND ?",
         (mp, fmt_ts(t0), fmt_ts(t1)),
     ):
-        csv_at.setdefault(row["ts"], {})[row["meter"]] = _dec(row["cum_kwh"])
+        csv_at.setdefault(row["ts"], {})[row["meter"]] = (
+            _dec(row["cum_kwh"]), bool(row["legacy_unverified"]))
 
     forms: dict[str, dict] = {}
     for row in conn.execute(
@@ -68,8 +82,9 @@ def compute_day(conn, mp: str, day: date) -> dict:
 
     # 每个整点的“左读数”（供 h→h+1 增量）与“右读数”（供 h-1→h 增量）。
     # 普通整点二者相同；换表整点右读数=旧表末读数、左读数=新表初值。
-    left: list[Optional[tuple[str, Decimal]]] = [None] * 25
-    right: list[Optional[tuple[str, Decimal]]] = [None] * 25
+    Reading = tuple[str, Decimal, bool]  # (表号, 读数, 旧库未校正)
+    left: list[Optional[Reading]] = [None] * 25
+    right: list[Optional[Reading]] = [None] * 25
     missing = [False] * 25
     hour_problems: list[list[tuple[str, str]]] = [[] for _ in range(25)]
 
@@ -80,17 +95,21 @@ def compute_day(conn, mp: str, day: date) -> dict:
         if form is not None:
             om, nm = form["old_meter"], form["new_meter"]
             of, ni = _dec(form["old_final_kwh"]), _dec(form["new_initial_kwh"])
-            right[i] = (om, of)
-            left[i] = (nm, ni)
-            if om in csvr and csvr[om] != of:
+            of_legacy = bool(form["legacy_unverified"])
+            ni_legacy = of_legacy  # 同一张单据的值一起迁移/校正
+            right[i] = (om, of, of_legacy)
+            left[i] = (nm, ni, ni_legacy)
+            # 旧库迁移值未经原始单据校正时，其小数不可知：与常规读数的差异
+            # 不能据此判为真实冲突（相关增量会以 legacy_precision_unverified 待核）。
+            if om in csvr and csvr[om][0] != of and not (of_legacy or csvr[om][1]):
                 hour_problems[i].append((
                     REASON_CONFLICT,
-                    f"整点 {key} 表 {om} 常规读数 {csvr[om]} 与换表单旧表末读数 {of} 冲突",
+                    f"整点 {key} 表 {om} 常规读数 {csvr[om][0]} 与换表单旧表末读数 {of} 冲突",
                 ))
-            if nm in csvr and csvr[nm] != ni:
+            if nm in csvr and csvr[nm][0] != ni and not (ni_legacy or csvr[nm][1]):
                 hour_problems[i].append((
                     REASON_CONFLICT,
-                    f"整点 {key} 表 {nm} 常规读数 {csvr[nm]} 与换表单新表初值 {ni} 冲突",
+                    f"整点 {key} 表 {nm} 常规读数 {csvr[nm][0]} 与换表单新表初值 {ni} 冲突",
                 ))
             extra = sorted(set(csvr) - {om, nm})
             if extra:
@@ -102,8 +121,8 @@ def compute_day(conn, mp: str, day: date) -> dict:
             if not csvr:
                 missing[i] = True
             elif len(csvr) == 1:
-                m, v = next(iter(csvr.items()))
-                left[i] = right[i] = (m, v)
+                m, (v, legacy) = next(iter(csvr.items()))
+                left[i] = right[i] = (m, v, legacy)
             else:
                 hour_problems[i].append((
                     REASON_UNRECORDED,
@@ -130,7 +149,7 @@ def compute_day(conn, mp: str, day: date) -> dict:
             add(REASON_MISSING, "缺整点读数: " + ", ".join(which))
 
         L, R = left[i], right[i + 1]
-        meter = (L or R or (None, None))[0]
+        meter = (L or R or (None, None, False))[0]
         delta: Optional[Decimal] = None
         if L is not None and R is not None:
             if L[0] != R[0]:
@@ -145,6 +164,12 @@ def compute_day(conn, mp: str, day: date) -> dict:
                 if d < 0:
                     add(REASON_REGRESSION,
                         f"表 {L[0]} 累计读数倒退: {L[1]} → {R[1]}")
+                elif L[2] or R[2]:
+                    # 旧库 REAL 迁移值：原始小数不可知，差值不可作为确定电量。
+                    legacy_hours = [fmt_ts(hours[j]) for j, r in ((i, L), (i + 1, R)) if r[2]]
+                    add(REASON_LEGACY,
+                        "旧库 REAL 迁移读数未按原始 CSV 校正，原始小数不可知: "
+                        + ", ".join(legacy_hours))
                 else:
                     delta = d
 
@@ -152,7 +177,7 @@ def compute_day(conn, mp: str, day: date) -> dict:
             "start": fmt_ts(hours[i]),
             "end": fmt_ts(hours[i + 1]),
             "meter": meter,
-            "delta_kwh": _num(delta),
+            "delta_kwh": _out(delta),
             "status": "ok" if not reasons else "pending",
             "reasons": reasons,
             "detail": "；".join(details) if details else None,
@@ -182,7 +207,8 @@ def compute_day(conn, mp: str, day: date) -> dict:
             })
 
     known = sum(
-        (Decimal(str(inc["delta_kwh"])) for inc in increments if inc["status"] == "ok"),
+        (inc["delta_kwh"] for inc in increments
+         if inc["status"] == "ok" and inc["delta_kwh"] is not None),
         Decimal("0"),
     )
     status = "pending" if pending_intervals else "ok"
@@ -199,8 +225,8 @@ def compute_day(conn, mp: str, day: date) -> dict:
         "date": day.isoformat(),
         "status": status,
         # 有待核区间时不给确定日总量
-        "total_kwh": None if pending_intervals else _num(known),
-        "known_kwh": _num(known),
+        "total_kwh": None if pending_intervals else _out(known),
+        "known_kwh": _out(known),
         "pending_intervals": pending_intervals,
         "increments": increments,
         "snapshot": snapshot,
